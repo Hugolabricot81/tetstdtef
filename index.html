@@ -33,7 +33,7 @@
   };
 
   const APP_ID = firebaseConfig.projectId || "geoclasse-demo";
-  const COLLECTION_PATH = `/artifacts/${APP_ID}/public/data`;
+  const COLLECTION_PATH = `artifacts/${APP_ID}/public`;
 
   let app, db, auth, uid;
   let currentRound = null;
@@ -132,13 +132,13 @@
       console.log("[DEMO] Score soumis:", score);
       return;
     }
-    const ref = doc(db, COLLECTION_PATH, 'scores', 'rounds', roundId, 'players', uid);
+    const ref = doc(db, COLLECTION_PATH, `score_${roundId}_${uid}`);
     await setDoc(ref, { pseudo, score, totalScore, ts: Date.now() }, { merge: false });
   }
 
   async function updateLeaderboard(roundId, score) {
     if (window.__demoMode) return;
-    const ref = doc(db, COLLECTION_PATH, 'leaderboard', uid);
+    const ref = doc(db, COLLECTION_PATH, `lb_${uid}`);
     await setDoc(ref, { pseudo, totalScore, lastScore: score, ts: Date.now() });
   }
 
@@ -250,10 +250,13 @@
   // ── Admin: Leaderboard ────────────────────────────────────────────────────
   function listenLeaderboard() {
     if (window.__demoMode) return;
-    const ref = collection(db, COLLECTION_PATH, 'leaderboard');
+    const ref = collection(db, COLLECTION_PATH);
     adminLeaderboardUnsub = onSnapshot(ref, snap => {
       const players = [];
-      snap.forEach(d => players.push(d.data()));
+      snap.forEach(d => {
+        // Only leaderboard entries (lb_ prefix)
+        if (d.id.startsWith('lb_')) players.push(d.data());
+      });
       players.sort((a, b) => b.totalScore - a.totalScore);
       renderLeaderboard(players);
     });
@@ -875,11 +878,10 @@
       </div>
     </div>
     
-    <!-- Info banner -->
-    <div style="margin-top:16px;padding:16px;background:rgba(59,130,246,0.08);border:1px solid var(--blue-dim);border-radius:12px;">
-      <p style="margin:0;font-size:12px;color:var(--blue);line-height:1.6;">
-        <strong>ℹ️ Mode démo :</strong> Sans configuration Firebase, les données ne sont pas synchronisées. 
-        Configurez <code style="background:rgba(255,255,255,0.1);padding:1px 6px;border-radius:4px;">firebaseConfig</code> dans le code source pour activer la multijoueur temps réel.
+    <!-- Status banner -->
+    <div style="margin-top:16px;padding:16px;background:rgba(16,185,129,0.08);border:1px solid var(--emerald-dim);border-radius:12px;">
+      <p style="margin:0;font-size:12px;color:var(--emerald);line-height:1.6;">
+        <strong>✅ Firebase connecté :</strong> Projet <code style="background:rgba(255,255,255,0.1);padding:1px 6px;border-radius:4px;">geoguessrclasse</code> — Les données sont synchronisées en temps réel.
       </p>
     </div>
   </div>
