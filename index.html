@@ -452,45 +452,32 @@ function initMap(){
   });
 }
 
-// ── IMAGE VIEWER (drag panoramique) ──────────────────────────────────────────
+// ── IMAGE VIEWER (drag panoramique) ─────────────────────────────────────────
 function loadPanorama(url){
-  viewer = null;
   const wrap = document.getElementById('panorama');
   wrap.innerHTML = '';
-  wrap.style.cssText = 'width:100%;height:100%;overflow:hidden;cursor:grab;position:relative;background:#06090c;';
+  wrap.style.cssText = 'width:100%;height:100%;overflow-x:auto;overflow-y:hidden;cursor:grab;position:relative;background:#06090c;scrollbar-width:none;';
 
-  // Loading indicator
-  wrap.innerHTML = '<div id="pano-loading" style="position:absolute;inset:0;display:flex;align-items:center;justify-content:center;color:#64748b;font-size:14px;font-family:Syne,sans-serif;">⏳ Chargement…</div>';
+  wrap.innerHTML = '<div style="position:absolute;inset:0;display:flex;align-items:center;justify-content:center;color:#64748b;font-size:14px;font-family:Syne,sans-serif;">⏳ Chargement...</div>';
 
   const img = new Image();
-  img.onload = () => {
+  img.onload = function() {
     wrap.innerHTML = '';
-    img.style.cssText = 'height:100%;width:auto;max-width:none;display:block;user-select:none;-webkit-user-drag:none;';
+    img.style.cssText = 'height:100%;width:auto;max-width:none;display:block;user-select:none;pointer-events:none;';
     wrap.appendChild(img);
+    const excess = img.naturalWidth * (wrap.offsetHeight / img.naturalHeight) - wrap.offsetWidth;
+    if(excess > 0) wrap.scrollLeft = excess / 2;
 
-    // Center image
-    const centerX = (img.naturalWidth * (wrap.offsetHeight / img.naturalHeight) - wrap.offsetWidth) / 2;
-    wrap.scrollLeft = centerX > 0 ? centerX : 0;
-
-    // Drag to scroll
-    let isDragging = false, startX = 0, scrollStart = 0;
-    wrap.addEventListener('mousedown', e => {
-      isDragging = true; startX = e.pageX; scrollStart = wrap.scrollLeft;
-      wrap.style.cursor = 'grabbing'; e.preventDefault();
-    });
-    window.addEventListener('mousemove', e => {
-      if(!isDragging) return;
-      wrap.scrollLeft = scrollStart - (e.pageX - startX);
-    });
-    window.addEventListener('mouseup', () => { isDragging = false; wrap.style.cursor = 'grab'; });
-
-    // Touch support
-    let touchStartX = 0, touchScrollStart = 0;
-    wrap.addEventListener('touchstart', e => { touchStartX = e.touches[0].pageX; touchScrollStart = wrap.scrollLeft; }, {passive:true});
-    wrap.addEventListener('touchmove', e => { wrap.scrollLeft = touchScrollStart - (e.touches[0].pageX - touchStartX); }, {passive:true});
+    let dragging = false, startX = 0, scrollStart = 0;
+    wrap.addEventListener('mousedown', function(e){ dragging=true; startX=e.pageX; scrollStart=wrap.scrollLeft; wrap.style.cursor='grabbing'; e.preventDefault(); });
+    window.addEventListener('mousemove', function(e){ if(dragging) wrap.scrollLeft = scrollStart-(e.pageX-startX); });
+    window.addEventListener('mouseup', function(){ dragging=false; wrap.style.cursor='grab'; });
+    let tx=0, ts=0;
+    wrap.addEventListener('touchstart', function(e){ tx=e.touches[0].pageX; ts=wrap.scrollLeft; },{passive:true});
+    wrap.addEventListener('touchmove', function(e){ wrap.scrollLeft=ts-(e.touches[0].pageX-tx); },{passive:true});
   };
-  img.onerror = () => {
-    wrap.innerHTML = '<div style="position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;color:#ef4444;font-family:Syne,sans-serif;gap:8px;"><div style="font-size:32px;">⚠️</div><div style="font-size:14px;">Image inaccessible</div><div style="font-size:11px;color:#64748b;max-width:280px;text-align:center;">Vérifiez l'URL dans la console admin</div></div>';
+  img.onerror = function() {
+    wrap.innerHTML = '<div style="position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;color:#ef4444;font-family:Syne,sans-serif;gap:8px;"><div style="font-size:32px;">⚠️</div><div style="font-size:13px;">Image inaccessible</div></div>';
   };
   img.src = url;
 }
@@ -679,7 +666,7 @@ document.addEventListener('DOMContentLoaded',()=>{
     const lat=parseFloat(document.getElementById('admin-lat').value);
     const lng=parseFloat(document.getElementById('admin-lng').value);
     const name=document.getElementById('admin-custom-name').value.trim()||'Lieu mystère';
-    if(!url||isNaN(lat)||isNaN(lng)){alert('Remplissez l\'URL et les coordonnées.');return;}
+    if(!url||isNaN(lat)||isNaN(lng)){alert('Remplissez URL et coordonnées.');return;}
     broadcastPreset({url,lat,lng,name,flag:'📍',diff:'medium'});
   });
 
