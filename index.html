@@ -2,890 +2,671 @@
 <html lang="fr">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0">
 <title>GéoClasse — Défi de Localisation</title>
 
-<!-- Leaflet -->
 <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css"/>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
-
-<!-- Pannellum -->
 <link rel="stylesheet" href="https://cdn.pannellum.org/2.5/pannellum.css"/>
 <script src="https://cdn.pannellum.org/2.5/pannellum.js"></script>
 
-<!-- Tailwind -->
-<script src="https://cdnjs.cloudflare.com/ajax/libs/tailwindcss/2.2.19/tailwind.min.js"></script>
-
-<!-- Firebase -->
-<script type="module">
-  import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-app.js";
-  import { getFirestore, doc, setDoc, onSnapshot, collection, getDocs } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore.js";
-  import { getAuth, signInAnonymously } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-auth.js";
-
-  const firebaseConfig = {
-    apiKey: "AIzaSyBols3D4_fpOMAtbBgOcoAYy9ejpvCJr70",
-    authDomain: "geoguessrclasse.firebaseapp.com",
-    projectId: "geoguessrclasse",
-    storageBucket: "geoguessrclasse.firebasestorage.app",
-    messagingSenderId: "157640260530",
-    appId: "1:157640260530:web:454fbf0c10fd001cc682ab",
-    measurementId: "G-08D4Z2QLHF"
-  };
-
-  const APP_ID = firebaseConfig.projectId || "geoclasse-demo";
-  const COLLECTION_PATH = `artifacts/${APP_ID}/public`;
-
-  let app, db, auth, uid;
-  let currentRound = null;
-  let userMarker = null;
-  let guessLatLng = null;
-  let map = null;
-  let viewer = null;
-  let totalScore = 0;
-  let pseudo = "";
-  let isAdmin = false;
-  let adminLeaderboardUnsub = null;
-  let roundUnsub = null;
-
-  const ADMIN_CODE = "PROF2024";
-
-  // ── Init Firebase ─────────────────────────────────────────────────────────
-  async function initFirebase() {
-    if (!firebaseConfig.apiKey) {
-      console.warn("Firebase non configuré — mode démo local activé.");
-      window.__demoMode = true;
-      return false;
-    }
-    app = initializeApp(firebaseConfig);
-    db = getFirestore(app);
-    auth = getAuth(app);
-    try {
-      const cred = await signInAnonymously(auth);
-      uid = cred.user.uid;
-    } catch(e) { console.error(e); }
-    return true;
-  }
-
-  // ── Score Calculation ─────────────────────────────────────────────────────
-  function calcScore(distanceMeters) {
-    const maxScore = 5000;
-    const k = 0.000002;
-    return Math.round(maxScore * Math.exp(-k * distanceMeters));
-  }
-
-  function haversineDistance(lat1, lng1, lat2, lng2) {
-    const R = 6371000;
-    const toRad = x => x * Math.PI / 180;
-    const dLat = toRad(lat2 - lat1);
-    const dLng = toRad(lng2 - lng1);
-    const a = Math.sin(dLat/2)**2 + Math.cos(toRad(lat1))*Math.cos(toRad(lat2))*Math.sin(dLng/2)**2;
-    return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
-  }
-
-  // ── Map Init ──────────────────────────────────────────────────────────────
-  function initMap() {
-    if (map) { map.remove(); map = null; }
-    map = L.map('game-map', { zoomControl: true, attributionControl: false });
-    L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', {
-      maxZoom: 19
-    }).addTo(map);
-    map.setView([20, 0], 2);
-    map.on('click', e => {
-      guessLatLng = e.latlng;
-      if (userMarker) map.removeLayer(userMarker);
-      userMarker = L.marker(e.latlng, {
-        icon: L.divIcon({
-          className: '',
-          html: `<div style="width:18px;height:18px;background:#10b981;border:3px solid #fff;border-radius:50%;box-shadow:0 0 10px #10b98188;"></div>`,
-          iconAnchor: [9,9]
-        })
-      }).addTo(map);
-      document.getElementById('btn-validate').classList.remove('opacity-50', 'cursor-not-allowed');
-      document.getElementById('btn-validate').disabled = false;
-    });
-  }
-
-  // ── Panorama ──────────────────────────────────────────────────────────────
-  function loadPanorama(url) {
-    if (viewer) { viewer.destroy(); viewer = null; }
-    const el = document.getElementById('panorama');
-    el.innerHTML = '';
-    viewer = pannellum.viewer('panorama', {
-      type: 'equirectangular',
-      panorama: url,
-      autoLoad: true,
-      showControls: false,
-      compass: false,
-      hotSpotDebug: false
-    });
-  }
-
-  // ── Screen Management ─────────────────────────────────────────────────────
-  function showScreen(id) {
-    document.querySelectorAll('.screen').forEach(s => s.classList.add('hidden'));
-    document.getElementById(id).classList.remove('hidden');
-  }
-
-  // ── Submit Score to Firestore ─────────────────────────────────────────────
-  async function submitScore(roundId, score) {
-    if (window.__demoMode) {
-      console.log("[DEMO] Score soumis:", score);
-      return;
-    }
-    const ref = doc(db, COLLECTION_PATH, `score_${roundId}_${uid}`);
-    await setDoc(ref, { pseudo, score, totalScore, ts: Date.now() }, { merge: false });
-  }
-
-  async function updateLeaderboard(roundId, score) {
-    if (window.__demoMode) return;
-    const ref = doc(db, COLLECTION_PATH, `lb_${uid}`);
-    await setDoc(ref, { pseudo, totalScore, lastScore: score, ts: Date.now() });
-  }
-
-  // ── Listen to Active Round ─────────────────────────────────────────────────
-  function listenToRound() {
-    if (window.__demoMode) return;
-    const ref = doc(db, COLLECTION_PATH, 'activeRound');
-    roundUnsub = onSnapshot(ref, snap => {
-      if (!snap.exists()) return;
-      const data = snap.data();
-      if (!data.active) {
-        showScreen('screen-lobby');
-        return;
-      }
-      currentRound = data;
-      startGameRound(data);
-    });
-  }
-
-  function startGameRound(data) {
-    showScreen('screen-game');
-    guessLatLng = null;
-    if (userMarker) { map.removeLayer(userMarker); userMarker = null; }
-    setTimeout(() => {
-      initMap();
-      loadPanorama(data.imageUrl);
-    }, 100);
-    document.getElementById('btn-validate').disabled = true;
-    document.getElementById('btn-validate').classList.add('opacity-50', 'cursor-not-allowed');
-    document.getElementById('hud-score').textContent = totalScore.toLocaleString();
-  }
-
-  // ── Validate Guess ────────────────────────────────────────────────────────
-  async function validateGuess() {
-    if (!guessLatLng || !currentRound) return;
-    const dist = haversineDistance(guessLatLng.lat, guessLatLng.lng, currentRound.targetLat, currentRound.targetLng);
-    const score = calcScore(dist);
-    totalScore += score;
-
-    // Draw dashed line
-    const targetLatLng = L.latLng(currentRound.targetLat, currentRound.targetLng);
-    L.polyline([guessLatLng, targetLatLng], {
-      color: '#3b82f6', weight: 2, dashArray: '6 4', opacity: 0.9
-    }).addTo(map);
-
-    // Target marker
-    L.marker(targetLatLng, {
-      icon: L.divIcon({
-        className: '',
-        html: `<div style="width:20px;height:20px;background:#ef4444;border:3px solid #fff;border-radius:50%;box-shadow:0 0 12px #ef444488;"></div>`,
-        iconAnchor: [10,10]
-      })
-    }).addTo(map);
-
-    map.fitBounds([guessLatLng, targetLatLng], { padding: [40, 40] });
-
-    if (!window.__demoMode && currentRound.id) {
-      await submitScore(currentRound.id, score);
-      await updateLeaderboard(currentRound.id, score);
-    }
-
-    showResultOverlay(score, dist);
-  }
-
-  function showResultOverlay(score, dist) {
-    const km = dist < 1000 ? `${Math.round(dist)} m` : `${(dist/1000).toFixed(1)} km`;
-    const overlay = document.getElementById('result-overlay');
-    document.getElementById('result-score').textContent = `+${score.toLocaleString()}`;
-    document.getElementById('result-distance').textContent = km;
-    document.getElementById('result-total').textContent = totalScore.toLocaleString();
-    overlay.classList.remove('hidden');
-    overlay.classList.add('flex');
-    setTimeout(() => {
-      overlay.classList.add('hidden');
-      overlay.classList.remove('flex');
-      showScreen('screen-lobby');
-    }, 5000);
-  }
-
-  // ── Admin: Broadcast Round ────────────────────────────────────────────────
-  async function broadcastRound() {
-    const imageUrl = document.getElementById('admin-image-url').value.trim();
-    const lat = parseFloat(document.getElementById('admin-lat').value);
-    const lng = parseFloat(document.getElementById('admin-lng').value);
-    if (!imageUrl || isNaN(lat) || isNaN(lng)) {
-      alert('Veuillez remplir tous les champs correctement.');
-      return;
-    }
-    const roundId = `round_${Date.now()}`;
-    const data = { id: roundId, imageUrl, targetLat: lat, targetLng: lng, active: true, startedAt: Date.now() };
-
-    if (window.__demoMode) {
-      currentRound = data;
-      alert('[DEMO] Round diffusé localement (Firebase non configuré).');
-      return;
-    }
-    const ref = doc(db, COLLECTION_PATH, 'activeRound');
-    await setDoc(ref, data);
-    document.getElementById('admin-broadcast-btn').textContent = '✓ Diffusé !';
-    setTimeout(() => document.getElementById('admin-broadcast-btn').textContent = 'Diffuser le Round', 1500);
-  }
-
-  async function stopRound() {
-    if (window.__demoMode) return;
-    const ref = doc(db, COLLECTION_PATH, 'activeRound');
-    await setDoc(ref, { active: false });
-  }
-
-  // ── Admin: Leaderboard ────────────────────────────────────────────────────
-  function listenLeaderboard() {
-    if (window.__demoMode) return;
-    const ref = collection(db, COLLECTION_PATH);
-    adminLeaderboardUnsub = onSnapshot(ref, snap => {
-      const players = [];
-      snap.forEach(d => {
-        // Only leaderboard entries (lb_ prefix)
-        if (d.id.startsWith('lb_')) players.push(d.data());
-      });
-      players.sort((a, b) => b.totalScore - a.totalScore);
-      renderLeaderboard(players);
-    });
-  }
-
-  function renderLeaderboard(players) {
-    const el = document.getElementById('admin-leaderboard');
-    if (!players.length) { el.innerHTML = '<p class="text-gray-500 text-sm text-center py-4">Aucun joueur connecté</p>'; return; }
-    el.innerHTML = players.slice(0, 20).map((p, i) => `
-      <div class="flex items-center justify-between py-2 px-3 rounded-xl mb-1 ${i===0?'bg-yellow-900 bg-opacity-30':i===1?'bg-gray-700 bg-opacity-30':i===2?'bg-orange-900 bg-opacity-30':'bg-gray-800 bg-opacity-40'}">
-        <div class="flex items-center gap-3">
-          <span class="text-lg font-bold w-8 text-center ${i===0?'text-yellow-400':i===1?'text-gray-300':i===2?'text-orange-400':'text-gray-500'}">${i===0?'🥇':i===1?'🥈':i===2?'🥉':i+1}</span>
-          <span class="font-semibold text-white">${p.pseudo}</span>
-        </div>
-        <span class="text-emerald-400 font-bold text-lg">${p.totalScore?.toLocaleString() || 0}</span>
-      </div>
-    `).join('');
-  }
-
-  // ── DOM Ready ─────────────────────────────────────────────────────────────
-  window.addEventListener('DOMContentLoaded', async () => {
-    await initFirebase();
-
-    // Join button
-    document.getElementById('btn-join').addEventListener('click', () => {
-      pseudo = document.getElementById('input-pseudo').value.trim();
-      if (!pseudo) { document.getElementById('input-pseudo').classList.add('ring-2', 'ring-red-500'); return; }
-      document.getElementById('lobby-pseudo').textContent = pseudo;
-      document.getElementById('lobby-score').textContent = '0';
-      showScreen('screen-lobby');
-      listenToRound();
-    });
-
-    document.getElementById('input-pseudo').addEventListener('keydown', e => {
-      if (e.key === 'Enter') document.getElementById('btn-join').click();
-    });
-
-    // Admin login
-    document.getElementById('btn-admin-login').addEventListener('click', () => {
-      const code = document.getElementById('input-admin-code').value;
-      if (code === ADMIN_CODE) {
-        isAdmin = true;
-        showScreen('screen-admin');
-        listenLeaderboard();
-      } else {
-        document.getElementById('admin-code-error').classList.remove('hidden');
-      }
-    });
-
-    document.getElementById('btn-toggle-admin').addEventListener('click', () => {
-      document.getElementById('admin-login-panel').classList.toggle('hidden');
-    });
-
-    // Broadcast
-    document.getElementById('admin-broadcast-btn').addEventListener('click', broadcastRound);
-    document.getElementById('admin-stop-btn').addEventListener('click', stopRound);
-
-    // Validate guess
-    document.getElementById('btn-validate').addEventListener('click', validateGuess);
-
-    // Back to lobby from admin
-    document.getElementById('admin-back-btn').addEventListener('click', () => {
-      if (adminLeaderboardUnsub) adminLeaderboardUnsub();
-      showScreen('screen-lobby');
-    });
-
-    document.getElementById('lobby-score').textContent = totalScore;
-  });
-
-  // Export for HTML onclick use
-  window._app = { broadcastRound, stopRound, validateGuess };
-</script>
-
 <style>
-  @import url('https://fonts.googleapis.com/css2?family=Syne:wght@400;600;700;800&family=DM+Mono:wght@400;500&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=Syne:wght@400;600;700;800&family=DM+Mono:wght@400;500&display=swap');
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+:root{
+  --bg:#06090c;--surface:#0e1419;--surface2:#161e26;--surface3:#1d2733;
+  --border:#1e2d3d;--border2:#253545;
+  --emerald:#10b981;--emerald-dim:#064e3b;--emerald-glow:#10b98133;
+  --blue:#3b82f6;--blue-dim:#1e3a5f;
+  --amber:#f59e0b;--red:#ef4444;
+  --text:#e2e8f0;--muted:#64748b;--muted2:#94a3b8;
+}
+html,body{height:100%;overflow:hidden;background:var(--bg);color:var(--text);font-family:'Syne',sans-serif;}
+.screen{position:fixed;inset:0;display:none;overflow:hidden;}
+.screen.active{display:flex;}
+::-webkit-scrollbar{width:4px}
+::-webkit-scrollbar-track{background:var(--surface)}
+::-webkit-scrollbar-thumb{background:var(--border2);border-radius:2px}
 
-  *, *::before, *::after { box-sizing: border-box; }
+.input{width:100%;background:var(--surface2);border:1px solid var(--border2);border-radius:10px;padding:12px 14px;color:var(--text);font-family:'Syne',sans-serif;font-size:14px;outline:none;transition:border-color .2s,box-shadow .2s;}
+.input:focus{border-color:var(--emerald);box-shadow:0 0 0 3px var(--emerald-glow);}
+.btn{border:none;border-radius:10px;padding:11px 20px;font-family:'Syne',sans-serif;font-size:14px;font-weight:700;cursor:pointer;transition:transform .15s,box-shadow .15s,opacity .15s;letter-spacing:.3px;}
+.btn:hover{transform:translateY(-1px);}
+.btn:active{transform:translateY(0);}
+.btn-green{background:linear-gradient(135deg,var(--emerald),#059669);color:#fff;box-shadow:0 4px 16px var(--emerald-glow);}
+.btn-green:hover{box-shadow:0 8px 24px #10b98144;}
+.btn-blue{background:linear-gradient(135deg,var(--blue),#2563eb);color:#fff;}
+.btn-red{background:linear-gradient(135deg,var(--red),#dc2626);color:#fff;}
+.btn-ghost{background:var(--surface2);border:1px solid var(--border2);color:var(--muted2);}
+.btn-ghost:hover{color:var(--text);border-color:var(--blue);}
+.label{font-size:11px;font-weight:700;letter-spacing:1.5px;text-transform:uppercase;color:var(--muted);margin-bottom:6px;display:block;}
+.card{background:var(--surface);border:1px solid var(--border);border-radius:16px;padding:20px;}
+.tag{display:inline-block;padding:3px 9px;border-radius:999px;font-size:10px;font-weight:700;letter-spacing:1px;text-transform:uppercase;cursor:pointer;}
+.tag-easy{background:#064e3b;color:#34d399;}
+.tag-medium{background:#78350f;color:#fbbf24;}
+.tag-hard{background:#7f1d1d;color:#fca5a5;}
+.tag-expert{background:#312e81;color:#a5b4fc;}
+.tag-all{background:var(--surface3);color:var(--muted2);}
 
-  :root {
-    --bg: #080c0f;
-    --surface: #0f1419;
-    --surface2: #171f27;
-    --border: #1e2d3d;
-    --emerald: #10b981;
-    --emerald-dim: #064e3b;
-    --blue: #3b82f6;
-    --blue-dim: #1e3a5f;
-    --text: #e2e8f0;
-    --muted: #64748b;
-  }
+.grid-bg{position:absolute;inset:0;opacity:.07;background-image:linear-gradient(var(--border) 1px,transparent 1px),linear-gradient(90deg,var(--border) 1px,transparent 1px);background-size:50px 50px;animation:gridMove 25s linear infinite;pointer-events:none;}
+@keyframes gridMove{from{background-position:0 0}to{background-position:50px 50px}}
 
-  html, body {
-    margin: 0; padding: 0;
-    background: var(--bg);
-    color: var(--text);
-    font-family: 'Syne', sans-serif;
-    height: 100%; overflow: hidden;
-  }
+/* WELCOME */
+#s-welcome{flex-direction:column;align-items:center;justify-content:center;background:var(--bg);}
+#s-welcome::before{content:'';position:absolute;inset:0;background:radial-gradient(ellipse 80% 60% at 50% 0%,#0d2235 0%,transparent 70%),radial-gradient(ellipse 40% 40% at 80% 85%,#071a0f 0%,transparent 60%);pointer-events:none;}
+.welcome-card{position:relative;z-index:10;background:rgba(14,20,25,.92);border:1px solid var(--border);border-radius:24px;padding:36px;width:100%;max-width:400px;backdrop-filter:blur(20px);box-shadow:0 32px 80px #00000080;}
+.logo-badge{width:72px;height:72px;background:linear-gradient(135deg,var(--emerald),#059669);border-radius:20px;display:flex;align-items:center;justify-content:center;font-size:32px;margin:0 auto 20px;animation:logoPulse 3s ease-in-out infinite;box-shadow:0 0 40px var(--emerald-glow);}
+@keyframes logoPulse{0%,100%{box-shadow:0 0 40px var(--emerald-glow)}50%{box-shadow:0 0 70px #10b98155}}
 
-  .screen { width: 100vw; height: 100vh; }
-  .hidden { display: none !important; }
+/* WAITING */
+#s-waiting{flex-direction:column;align-items:center;justify-content:center;background:var(--bg);position:relative;}
+#s-waiting::before{content:'';position:absolute;inset:0;background:radial-gradient(ellipse 70% 70% at 50% 50%,#071a0f 0%,transparent 70%);pointer-events:none;}
+.orbit-wrap{width:180px;height:180px;position:relative;margin:0 auto 32px;}
+.orbit-ring{position:absolute;border-radius:50%;border:1px solid;animation:spin 8s linear infinite;}
+.orbit-ring:nth-child(1){inset:0;border-color:rgba(16,185,129,.35);}
+.orbit-ring:nth-child(2){inset:24px;border-color:rgba(59,130,246,.25);animation-duration:13s;animation-direction:reverse;}
+.orbit-ring:nth-child(3){inset:48px;border-color:rgba(16,185,129,.15);animation-duration:18s;}
+.orbit-center{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;font-size:36px;}
+@keyframes spin{from{transform:rotate(0deg)}to{transform:rotate(360deg)}}
+.player-chip{background:var(--surface2);border:1px solid var(--border2);border-radius:999px;padding:5px 14px;font-size:12px;color:var(--muted2);animation:chipIn .3s ease;}
+@keyframes chipIn{from{opacity:0;transform:scale(.8)}to{opacity:1;transform:scale(1)}}
+@keyframes blink{0%,100%{opacity:1}50%{opacity:.35}}
 
-  /* ── SCROLLBAR ── */
-  ::-webkit-scrollbar { width: 4px; }
-  ::-webkit-scrollbar-track { background: var(--surface); }
-  ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 2px; }
+/* GAME */
+#s-game{flex-direction:column;background:#000;}
+#pano-wrap{flex:6;position:relative;overflow:hidden;min-height:0;}
+#panorama{width:100%;height:100%;}
+#map-wrap{flex:4;position:relative;border-top:2px solid var(--border);min-height:0;}
+#game-map{width:100%;height:100%;}
+.hud{position:absolute;top:14px;left:14px;right:14px;z-index:1000;display:flex;justify-content:space-between;align-items:center;pointer-events:none;}
+.score-pill{background:rgba(6,9,12,.88);border:1px solid var(--border2);border-radius:999px;padding:8px 18px;backdrop-filter:blur(12px);font-family:'DM Mono',monospace;font-size:16px;font-weight:700;color:var(--emerald);}
+#btn-validate{pointer-events:all;background:linear-gradient(135deg,var(--emerald),#059669);border:none;border-radius:999px;padding:11px 24px;color:#fff;font-family:'Syne',sans-serif;font-size:14px;font-weight:700;cursor:pointer;transition:transform .15s,box-shadow .15s,opacity .2s;box-shadow:0 4px 20px var(--emerald-glow);}
+#btn-validate:not(:disabled):hover{transform:translateY(-2px);box-shadow:0 8px 28px #10b98155;}
 
-  /* ── WELCOME SCREEN ── */
-  #screen-welcome {
-    display: flex; flex-direction: column;
-    align-items: center; justify-content: center;
-    position: relative; overflow: hidden;
-    background: var(--bg);
-  }
+/* RESULT */
+#result-overlay{position:fixed;inset:0;z-index:9999;background:rgba(0,0,0,.88);backdrop-filter:blur(10px);display:none;flex-direction:column;align-items:center;justify-content:center;}
+#result-overlay.show{display:flex;animation:fadeUp .4s ease;}
+@keyframes fadeUp{from{opacity:0;transform:translateY(20px)}to{opacity:1;transform:translateY(0)}}
+.result-card{background:var(--surface);border:1px solid var(--border2);border-radius:28px;padding:44px 40px;text-align:center;max-width:380px;width:92%;box-shadow:0 32px 80px #00000090;}
+.result-big{font-size:76px;font-weight:800;background:linear-gradient(135deg,var(--emerald),#34d399);-webkit-background-clip:text;-webkit-text-fill-color:transparent;font-family:'DM Mono',monospace;line-height:1;}
+.progress-bar{height:6px;background:var(--surface3);border-radius:3px;overflow:hidden;margin:16px 0 8px;}
+.progress-fill{height:100%;background:linear-gradient(90deg,var(--emerald),#34d399);border-radius:3px;transition:width 1.2s ease;}
+.result-bar{display:flex;justify-content:center;gap:24px;margin:16px 0;padding:16px;background:var(--surface2);border-radius:14px;}
 
-  #screen-welcome::before {
-    content: '';
-    position: absolute; inset: 0;
-    background: 
-      radial-gradient(ellipse 80% 60% at 50% 0%, #0d2235 0%, transparent 70%),
-      radial-gradient(ellipse 40% 40% at 80% 80%, #071a0f 0%, transparent 60%);
-  }
+/* ADMIN */
+#s-admin{flex-direction:column;background:var(--bg);}
+.admin-topbar{display:flex;align-items:center;justify-content:space-between;padding:14px 22px;background:var(--surface);border-bottom:1px solid var(--border);flex-shrink:0;gap:12px;}
+.admin-body{display:grid;grid-template-columns:300px 1fr;flex:1;overflow:hidden;min-height:0;}
+.admin-sidebar{border-right:1px solid var(--border);overflow-y:auto;padding:16px;}
+.admin-main{overflow-y:auto;padding:20px;}
+.section-title{font-size:10px;font-weight:700;letter-spacing:2px;text-transform:uppercase;color:var(--muted);margin:0 0 12px;padding-bottom:8px;border-bottom:1px solid var(--border);}
+.preset-btn{width:100%;text-align:left;background:var(--surface2);border:1px solid var(--border);border-radius:10px;padding:9px 11px;color:var(--text);font-family:'Syne',sans-serif;font-size:12px;cursor:pointer;transition:border-color .15s,background .15s;display:flex;align-items:center;gap:9px;margin-bottom:5px;}
+.preset-btn:hover{border-color:var(--blue);background:var(--surface3);}
+.preset-btn.selected{border-color:var(--emerald);background:rgba(16,185,129,.08);}
+.preset-info{flex:1;min-width:0;}
+.preset-name{font-weight:700;font-size:12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+.preset-region{font-size:10px;color:var(--muted);margin-top:1px;}
+.stat-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-bottom:18px;}
+.stat-card{background:var(--surface2);border:1px solid var(--border);border-radius:12px;padding:14px;text-align:center;}
+.stat-num{font-size:28px;font-weight:800;font-family:'DM Mono',monospace;line-height:1;}
+.stat-lbl{font-size:10px;letter-spacing:1.5px;text-transform:uppercase;color:var(--muted);margin-top:4px;}
+.tab-bar{display:flex;gap:4px;background:var(--surface2);border-radius:12px;padding:4px;margin-bottom:18px;}
+.tab{flex:1;text-align:center;padding:8px;border-radius:8px;font-size:12px;font-weight:700;cursor:pointer;color:var(--muted);border:none;background:transparent;font-family:'Syne',sans-serif;transition:background .2s,color .2s;}
+.tab.active{background:var(--surface3);color:var(--text);}
+.tab-pane{display:none;}
+.tab-pane.active{display:block;}
+.lb-row{display:flex;align-items:center;justify-content:space-between;padding:10px 12px;border-radius:10px;margin-bottom:4px;}
+.lb-gold{background:rgba(245,158,11,.08);border:1px solid rgba(245,158,11,.2);}
+.lb-silver{background:rgba(148,163,184,.06);border:1px solid rgba(148,163,184,.15);}
+.lb-bronze{background:rgba(180,100,40,.08);border:1px solid rgba(180,100,40,.2);}
+.lb-normal{background:var(--surface2);border:1px solid var(--border);}
+.mono-score{font-family:'DM Mono',monospace;font-size:17px;font-weight:700;color:var(--emerald);}
+.diff-filter{display:flex;gap:5px;flex-wrap:wrap;margin-bottom:12px;}
 
-  .globe-grid {
-    position: absolute; inset: 0; overflow: hidden; opacity: 0.15;
-    background-image: 
-      linear-gradient(var(--border) 1px, transparent 1px),
-      linear-gradient(90deg, var(--border) 1px, transparent 1px);
-    background-size: 60px 60px;
-    animation: gridSlide 20s linear infinite;
-  }
-
-  @keyframes gridSlide {
-    from { background-position: 0 0; }
-    to { background-position: 60px 60px; }
-  }
-
-  .logo-badge {
-    width: 80px; height: 80px;
-    background: linear-gradient(135deg, var(--emerald), #059669);
-    border-radius: 24px;
-    display: flex; align-items: center; justify-content: center;
-    font-size: 36px;
-    box-shadow: 0 0 40px #10b98133, 0 8px 32px #00000060;
-    margin-bottom: 24px;
-    animation: pulse-glow 3s ease-in-out infinite;
-  }
-
-  @keyframes pulse-glow {
-    0%, 100% { box-shadow: 0 0 40px #10b98133, 0 8px 32px #00000060; }
-    50% { box-shadow: 0 0 70px #10b98155, 0 8px 32px #00000060; }
-  }
-
-  .welcome-card {
-    position: relative; z-index: 10;
-    background: rgba(15, 20, 25, 0.85);
-    border: 1px solid var(--border);
-    border-radius: 24px;
-    padding: 40px;
-    width: 100%; max-width: 420px;
-    backdrop-filter: blur(20px);
-    box-shadow: 0 32px 80px #00000080;
-  }
-
-  .input-field {
-    width: 100%;
-    background: var(--surface2);
-    border: 1px solid var(--border);
-    border-radius: 12px;
-    padding: 14px 16px;
-    color: var(--text);
-    font-family: 'Syne', sans-serif;
-    font-size: 16px;
-    outline: none;
-    transition: border-color 0.2s, box-shadow 0.2s;
-  }
-
-  .input-field:focus {
-    border-color: var(--emerald);
-    box-shadow: 0 0 0 3px #10b98122;
-  }
-
-  .btn-primary {
-    width: 100%;
-    background: linear-gradient(135deg, var(--emerald), #059669);
-    border: none; border-radius: 12px;
-    padding: 14px;
-    color: #fff; font-family: 'Syne', sans-serif;
-    font-size: 16px; font-weight: 700;
-    cursor: pointer; letter-spacing: 0.5px;
-    transition: transform 0.15s, box-shadow 0.15s;
-  }
-
-  .btn-primary:hover {
-    transform: translateY(-2px);
-    box-shadow: 0 8px 24px #10b98133;
-  }
-
-  .btn-primary:active { transform: translateY(0); }
-
-  /* ── LOBBY ── */
-  #screen-lobby {
-    display: flex; flex-direction: column;
-    align-items: center; justify-content: center;
-    background: var(--bg);
-    position: relative; overflow: hidden;
-  }
-
-  #screen-lobby::before {
-    content: '';
-    position: absolute; inset: 0;
-    background: radial-gradient(ellipse 60% 60% at 50% 50%, #0a1a0f 0%, transparent 70%);
-  }
-
-  .waiting-pulse {
-    width: 160px; height: 160px;
-    border-radius: 50%;
-    display: flex; align-items: center; justify-content: center;
-    position: relative; margin-bottom: 32px;
-  }
-
-  .waiting-pulse::before, .waiting-pulse::after {
-    content: ''; position: absolute; inset: 0;
-    border-radius: 50%; border: 2px solid var(--emerald);
-    animation: ripple 2.5s ease-out infinite;
-  }
-
-  .waiting-pulse::after { animation-delay: 1.25s; }
-
-  @keyframes ripple {
-    0% { transform: scale(0.8); opacity: 1; }
-    100% { transform: scale(1.6); opacity: 0; }
-  }
-
-  .score-display {
-    font-size: 72px; font-weight: 800;
-    background: linear-gradient(135deg, var(--emerald), #34d399);
-    -webkit-background-clip: text; -webkit-text-fill-color: transparent;
-    line-height: 1; font-family: 'DM Mono', monospace;
-  }
-
-  /* ── GAME SCREEN ── */
-  #screen-game {
-    display: flex; flex-direction: column;
-    background: var(--bg);
-    overflow: hidden;
-  }
-
-  #panorama-wrap {
-    flex: 6; position: relative; overflow: hidden;
-    min-height: 0;
-  }
-
-  #panorama { width: 100%; height: 100%; }
-
-  #map-wrap {
-    flex: 4; position: relative;
-    border-top: 2px solid var(--border);
-    min-height: 0;
-  }
-
-  #game-map { width: 100%; height: 100%; }
-
-  .hud {
-    position: absolute; top: 16px; left: 16px; right: 16px;
-    display: flex; justify-content: space-between; align-items: center;
-    z-index: 1000; pointer-events: none;
-  }
-
-  .hud-score-pill {
-    background: rgba(8, 12, 15, 0.85);
-    border: 1px solid var(--border);
-    border-radius: 999px;
-    padding: 8px 20px;
-    backdrop-filter: blur(12px);
-    font-family: 'DM Mono', monospace;
-    font-size: 18px; font-weight: 700;
-    color: var(--emerald);
-  }
-
-  #btn-validate {
-    pointer-events: all;
-    background: linear-gradient(135deg, var(--emerald), #059669);
-    border: none; border-radius: 999px;
-    padding: 12px 28px;
-    color: #fff; font-family: 'Syne', sans-serif;
-    font-size: 15px; font-weight: 700;
-    cursor: pointer; letter-spacing: 0.5px;
-    transition: transform 0.15s, box-shadow 0.15s, opacity 0.2s;
-    box-shadow: 0 4px 20px #10b98144;
-  }
-
-  #btn-validate:not(:disabled):hover {
-    transform: translateY(-2px);
-    box-shadow: 0 8px 28px #10b98155;
-  }
-
-  /* ── RESULT OVERLAY ── */
-  #result-overlay {
-    position: fixed; inset: 0; z-index: 9999;
-    background: rgba(0,0,0,0.85);
-    backdrop-filter: blur(8px);
-    flex-direction: column;
-    align-items: center; justify-content: center;
-    animation: fadeIn 0.4s ease;
-  }
-
-  @keyframes fadeIn {
-    from { opacity: 0; transform: scale(0.95); }
-    to { opacity: 1; transform: scale(1); }
-  }
-
-  .result-card {
-    background: var(--surface);
-    border: 1px solid var(--border);
-    border-radius: 28px;
-    padding: 48px 40px;
-    text-align: center;
-    max-width: 380px; width: 90%;
-    box-shadow: 0 32px 80px #00000090;
-  }
-
-  .result-score-big {
-    font-size: 80px; font-weight: 800;
-    background: linear-gradient(135deg, #10b981, #34d399);
-    -webkit-background-clip: text; -webkit-text-fill-color: transparent;
-    font-family: 'DM Mono', monospace;
-    line-height: 1;
-  }
-
-  /* ── ADMIN SCREEN ── */
-  #screen-admin {
-    display: flex; flex-direction: column;
-    background: var(--bg); overflow-y: auto;
-    padding: 24px;
-  }
-
-  .admin-card {
-    background: var(--surface);
-    border: 1px solid var(--border);
-    border-radius: 20px;
-    padding: 24px;
-    margin-bottom: 20px;
-  }
-
-  .admin-title {
-    font-size: 13px; font-weight: 700;
-    letter-spacing: 2px; text-transform: uppercase;
-    color: var(--muted); margin-bottom: 16px;
-  }
-
-  .btn-admin {
-    background: linear-gradient(135deg, var(--blue), #2563eb);
-    border: none; border-radius: 10px;
-    padding: 12px 24px;
-    color: #fff; font-family: 'Syne', sans-serif;
-    font-size: 14px; font-weight: 700;
-    cursor: pointer;
-    transition: transform 0.15s, opacity 0.15s;
-  }
-
-  .btn-admin:hover { transform: translateY(-1px); }
-
-  .btn-danger {
-    background: linear-gradient(135deg, #ef4444, #dc2626);
-    border: none; border-radius: 10px;
-    padding: 12px 24px;
-    color: #fff; font-family: 'Syne', sans-serif;
-    font-size: 14px; font-weight: 700;
-    cursor: pointer;
-    transition: transform 0.15s;
-  }
-
-  .btn-secondary {
-    background: var(--surface2);
-    border: 1px solid var(--border);
-    border-radius: 10px;
-    padding: 10px 20px;
-    color: var(--muted); font-family: 'Syne', sans-serif;
-    font-size: 13px;
-    cursor: pointer;
-    transition: color 0.15s, border-color 0.15s;
-  }
-
-  .btn-secondary:hover { color: var(--text); border-color: var(--blue); }
-
-  .label { font-size: 12px; font-weight: 600; color: var(--muted); margin-bottom: 6px; letter-spacing: 1px; text-transform: uppercase; }
-
-  /* ── Responsive game layout ── */
-  @media (orientation: landscape) and (max-height: 600px) {
-    #screen-game { flex-direction: row; }
-    #panorama-wrap { flex: 6; border-top: none; border-right: 2px solid var(--border); }
-    #map-wrap { flex: 4; }
-    .hud { top: 8px; left: 8px; right: 8px; }
-  }
-
-  /* Map attribution */
-  .leaflet-control-attribution { display: none; }
-
-  /* Pannellum overrides */
-  .pnlm-controls { display: none; }
+@media(max-width:680px){
+  .admin-body{grid-template-columns:1fr;grid-template-rows:220px 1fr;}
+  .admin-sidebar{border-right:none;border-bottom:1px solid var(--border);overflow-y:auto;}
+  .stat-grid{grid-template-columns:repeat(3,1fr);}
+}
+@media(orientation:landscape) and (max-height:500px){
+  #s-game{flex-direction:row;}
+  #pano-wrap{flex:6;border-top:none;border-right:2px solid var(--border);}
+  #map-wrap{flex:4;}
+}
+.leaflet-control-attribution{display:none!important;}
+.pnlm-controls-container{display:none!important;}
+.pnlm-container{background:#06090c!important;}
 </style>
 </head>
 <body>
 
-<!-- ══════════════════════════════════════
-     SCREEN: WELCOME
-══════════════════════════════════════ -->
-<div id="screen-welcome" class="screen">
-  <div class="globe-grid"></div>
-  
-  <div class="welcome-card" style="position:relative;z-index:10;">
-    <div style="display:flex;flex-direction:column;align-items:center;margin-bottom:32px;">
-      <div class="logo-badge">🌍</div>
-      <h1 style="font-size:32px;font-weight:800;margin:0 0 6px;letter-spacing:-0.5px;">GéoClasse</h1>
-      <p style="color:var(--muted);font-size:14px;margin:0;letter-spacing:1px;text-transform:uppercase;">Défi de Localisation</p>
+<!-- ═══════════════════ WELCOME ═══════════════════ -->
+<div id="s-welcome" class="screen active">
+  <div class="grid-bg"></div>
+  <div class="welcome-card">
+    <div class="logo-badge">🌍</div>
+    <h1 style="text-align:center;font-size:26px;font-weight:800;letter-spacing:-.5px;margin-bottom:4px;">GéoClasse</h1>
+    <p style="text-align:center;color:var(--muted);font-size:11px;letter-spacing:2.5px;text-transform:uppercase;margin-bottom:28px;">Défi de Localisation</p>
+    <div style="margin-bottom:14px;">
+      <label class="label">Ton pseudo</label>
+      <input id="inp-pseudo" class="input" type="text" placeholder="Ex: Thomas42" maxlength="20" autocomplete="off"/>
     </div>
-
-    <div style="margin-bottom:16px;">
-      <div class="label">Ton pseudo</div>
-      <input id="input-pseudo" class="input-field" type="text" placeholder="Ex: Thomas42" maxlength="20" autocomplete="off"/>
-    </div>
-
-    <button id="btn-join" class="btn-primary">Rejoindre la Partie →</button>
-
-    <!-- Admin toggle -->
-    <div style="margin-top:24px;border-top:1px solid var(--border);padding-top:20px;">
-      <button id="btn-toggle-admin" class="btn-secondary" style="width:100%;font-size:12px;color:var(--muted);">
-        🔐 Accès Professeur
-      </button>
-      <div id="admin-login-panel" class="hidden" style="margin-top:14px;">
-        <div class="label">Code admin</div>
-        <input id="input-admin-code" class="input-field" type="password" placeholder="••••••••" style="margin-bottom:10px;"/>
-        <p id="admin-code-error" class="hidden" style="color:#ef4444;font-size:12px;margin:0 0 8px;">Code incorrect</p>
-        <button id="btn-admin-login" style="width:100%;background:var(--surface2);border:1px solid var(--border);border-radius:10px;padding:11px;color:var(--text);font-family:'Syne',sans-serif;font-size:14px;font-weight:600;cursor:pointer;">
-          Accéder à la Console
-        </button>
+    <button id="btn-join" class="btn btn-green" style="width:100%;padding:14px;font-size:15px;">Rejoindre la Partie →</button>
+    <div style="margin-top:18px;padding-top:18px;border-top:1px solid var(--border);">
+      <button id="btn-toggle-admin" class="btn btn-ghost" style="width:100%;font-size:12px;">🔐 Accès Professeur</button>
+      <div id="admin-login-panel" style="display:none;margin-top:12px;">
+        <label class="label">Code admin</label>
+        <input id="inp-admin-code" class="input" type="password" placeholder="••••••••" style="margin-bottom:8px;"/>
+        <p id="admin-err" style="color:var(--red);font-size:12px;margin-bottom:8px;display:none;">Code incorrect</p>
+        <button id="btn-admin-login" class="btn btn-ghost" style="width:100%;">Accéder à la Console</button>
       </div>
     </div>
   </div>
 </div>
 
 
-<!-- ══════════════════════════════════════
-     SCREEN: LOBBY
-══════════════════════════════════════ -->
-<div id="screen-lobby" class="screen hidden" style="display:none;flex-direction:column;align-items:center;justify-content:center;position:relative;overflow:hidden;">
-  <div style="position:absolute;inset:0;background:radial-gradient(ellipse 60% 60% at 50% 50%, #0a1a0f 0%, transparent 70%);"></div>
-  
-  <div style="position:relative;z-index:10;text-align:center;">
-    <div class="waiting-pulse" style="margin:0 auto 32px;">
-      <div style="width:80px;height:80px;background:var(--emerald-dim);border-radius:50%;border:2px solid var(--emerald);display:flex;align-items:center;justify-content:center;font-size:32px;">⏳</div>
+<!-- ═══════════════════ WAITING ═══════════════════ -->
+<div id="s-waiting" class="screen" style="flex-direction:column;align-items:center;justify-content:center;position:relative;">
+  <div class="grid-bg"></div>
+  <div style="position:relative;z-index:10;text-align:center;padding:24px;width:100%;max-width:480px;">
+    <div class="orbit-wrap">
+      <div class="orbit-ring"></div>
+      <div class="orbit-ring"></div>
+      <div class="orbit-ring"></div>
+      <div class="orbit-center">🌍</div>
     </div>
-    
-    <p style="color:var(--muted);font-size:13px;letter-spacing:2px;text-transform:uppercase;margin:0 0 8px;">Bienvenue,</p>
-    <h2 id="lobby-pseudo" style="font-size:36px;font-weight:800;margin:0 0 32px;color:var(--text);"></h2>
-    
-    <div style="background:var(--surface);border:1px solid var(--border);border-radius:20px;padding:32px 48px;">
-      <p style="color:var(--muted);font-size:12px;letter-spacing:2px;text-transform:uppercase;margin:0 0 8px;">Score Total</p>
-      <div class="score-display" id="lobby-score">0</div>
-      <p style="color:var(--muted);font-size:13px;margin:16px 0 0;">pts</p>
+    <p style="color:var(--muted);font-size:11px;letter-spacing:2.5px;text-transform:uppercase;margin-bottom:6px;">Bienvenue</p>
+    <h2 id="w-pseudo" style="font-size:32px;font-weight:800;margin-bottom:22px;"></h2>
+    <div class="card" style="display:inline-block;min-width:190px;text-align:center;margin-bottom:22px;padding:20px 32px;">
+      <div class="label" style="margin-bottom:8px;">Score total</div>
+      <div id="w-score" style="font-size:54px;font-weight:800;font-family:'DM Mono',monospace;background:linear-gradient(135deg,var(--emerald),#34d399);-webkit-background-clip:text;-webkit-text-fill-color:transparent;line-height:1;">0</div>
+      <div style="color:var(--muted);font-size:12px;margin-top:4px;">points</div>
     </div>
-    
-    <p style="color:var(--muted);font-size:13px;margin-top:32px;animation:blink 2s ease-in-out infinite;">
-      En attente du professeur…
-    </p>
+    <p style="color:var(--muted);font-size:13px;animation:blink 2s ease-in-out infinite;margin-bottom:16px;">⏳ En attente du professeur…</p>
+    <div id="waiting-players" style="display:flex;gap:7px;flex-wrap:wrap;justify-content:center;max-width:400px;margin:0 auto;"></div>
   </div>
-
-  <style>@keyframes blink { 0%,100%{opacity:1} 50%{opacity:0.4} }</style>
 </div>
 
 
-<!-- ══════════════════════════════════════
-     SCREEN: GAME
-══════════════════════════════════════ -->
-<div id="screen-game" class="screen hidden">
-
-  <!-- HUD -->
-  <div class="hud" style="position:absolute;top:16px;left:16px;right:16px;z-index:1000;display:flex;justify-content:space-between;align-items:center;pointer-events:none;">
-    <div class="hud-score-pill">
-      <span style="color:var(--muted);font-size:11px;letter-spacing:1px;font-family:'Syne',sans-serif;font-weight:700;">SCORE </span>
+<!-- ═══════════════════ GAME ═══════════════════ -->
+<div id="s-game" class="screen">
+  <div class="hud">
+    <div class="score-pill">
+      <span style="color:var(--muted);font-size:10px;font-weight:700;font-family:'Syne',sans-serif;letter-spacing:1px;">SCORE </span>
       <span id="hud-score">0</span>
     </div>
-    <button id="btn-validate" disabled class="opacity-50 cursor-not-allowed">
-      ✓ Valider ma position
-    </button>
+    <button id="btn-validate" disabled style="opacity:.45;cursor:not-allowed;">✓ Valider ma position</button>
   </div>
-
-  <!-- Panorama -->
-  <div id="panorama-wrap">
-    <div id="panorama" style="width:100%;height:100%;"></div>
-  </div>
-
-  <!-- Map -->
+  <div id="pano-wrap"><div id="panorama"></div></div>
   <div id="map-wrap">
     <div id="game-map"></div>
-    <div style="position:absolute;bottom:12px;left:12px;z-index:500;background:rgba(8,12,15,0.8);border:1px solid var(--border);border-radius:8px;padding:6px 12px;backdrop-filter:blur(8px);font-size:11px;color:var(--muted);pointer-events:none;">
-      📍 Cliquez sur la carte pour placer votre hypothèse
-    </div>
+    <div style="position:absolute;bottom:10px;left:10px;z-index:500;background:rgba(6,9,12,.88);border:1px solid var(--border2);border-radius:8px;padding:5px 11px;font-size:11px;color:var(--muted);pointer-events:none;backdrop-filter:blur(8px);">📍 Cliquez sur la carte pour placer votre hypothèse</div>
   </div>
 </div>
 
 
-<!-- ══════════════════════════════════════
-     RESULT OVERLAY
-══════════════════════════════════════ -->
-<div id="result-overlay" class="hidden">
+<!-- ═══════════════════ RESULT OVERLAY ═══════════════════ -->
+<div id="result-overlay">
   <div class="result-card">
-    <div style="font-size:48px;margin-bottom:8px;">🎯</div>
-    <p style="color:var(--muted);font-size:12px;letter-spacing:2px;text-transform:uppercase;margin:0 0 4px;">Points gagnés</p>
-    <div class="result-score-big" id="result-score">0</div>
-    
-    <div style="display:flex;justify-content:center;gap:24px;margin:28px 0;padding:20px;background:var(--surface2);border-radius:16px;">
+    <div style="font-size:44px;margin-bottom:6px;">🎯</div>
+    <div class="label" style="text-align:center;margin-bottom:4px;">Points gagnés</div>
+    <div class="result-big" id="res-score">+0</div>
+    <div class="progress-bar"><div class="progress-fill" id="res-bar" style="width:0%"></div></div>
+    <div class="result-bar">
       <div style="text-align:center;">
-        <p style="color:var(--muted);font-size:11px;letter-spacing:1.5px;text-transform:uppercase;margin:0 0 4px;">Distance</p>
-        <p id="result-distance" style="font-size:22px;font-weight:800;color:var(--blue);margin:0;font-family:'DM Mono',monospace;"></p>
+        <div class="label" style="margin-bottom:4px;">Distance</div>
+        <div id="res-dist" style="font-size:20px;font-weight:800;font-family:'DM Mono',monospace;color:var(--blue);"></div>
       </div>
       <div style="width:1px;background:var(--border);"></div>
       <div style="text-align:center;">
-        <p style="color:var(--muted);font-size:11px;letter-spacing:1.5px;text-transform:uppercase;margin:0 0 4px;">Total</p>
-        <p id="result-total" style="font-size:22px;font-weight:800;color:var(--emerald);margin:0;font-family:'DM Mono',monospace;"></p>
+        <div class="label" style="margin-bottom:4px;">Total</div>
+        <div id="res-total" style="font-size:20px;font-weight:800;font-family:'DM Mono',monospace;color:var(--emerald);"></div>
       </div>
     </div>
-    
-    <p style="color:var(--muted);font-size:13px;margin:0;">Retour au lobby dans 5 secondes…</p>
+    <p style="color:var(--muted);font-size:12px;margin-top:4px;">Retour au lobby dans <span id="res-countdown">5</span>s…</p>
   </div>
 </div>
 
 
-<!-- ══════════════════════════════════════
-     SCREEN: ADMIN
-══════════════════════════════════════ -->
-<div id="screen-admin" class="screen hidden" style="background:var(--bg);overflow-y:auto;">
-  <div style="max-width:900px;margin:0 auto;padding:24px;">
-    
-    <!-- Header -->
-    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:28px;">
-      <div style="display:flex;align-items:center;gap:16px;">
-        <div style="width:48px;height:48px;background:linear-gradient(135deg,var(--blue),#2563eb);border-radius:14px;display:flex;align-items:center;justify-content:center;font-size:22px;">👨‍🏫</div>
-        <div>
-          <h1 style="margin:0;font-size:22px;font-weight:800;">Console Professeur</h1>
-          <p style="margin:0;color:var(--muted);font-size:12px;">Gérez vos rounds en temps réel</p>
-        </div>
+<!-- ═══════════════════ ADMIN DASHBOARD ═══════════════════ -->
+<div id="s-admin" class="screen">
+
+  <!-- Topbar -->
+  <div class="admin-topbar">
+    <div style="display:flex;align-items:center;gap:12px;min-width:0;">
+      <div style="width:40px;height:40px;background:linear-gradient(135deg,var(--blue),#2563eb);border-radius:11px;display:flex;align-items:center;justify-content:center;font-size:18px;flex-shrink:0;">👨‍🏫</div>
+      <div style="min-width:0;">
+        <div style="font-size:15px;font-weight:800;">Console Professeur</div>
+        <div style="font-size:11px;color:var(--emerald);">🟢 geoguessrclasse — Firebase connecté</div>
       </div>
-      <button id="admin-back-btn" class="btn-secondary">← Retour</button>
+    </div>
+    <div style="display:flex;gap:8px;flex-shrink:0;">
+      <button id="btn-reset-scores" class="btn btn-red" style="font-size:12px;padding:8px 14px;">🗑 Reset scores</button>
+      <button id="admin-back-btn" class="btn btn-ghost" style="font-size:12px;padding:8px 14px;">← Quitter</button>
+    </div>
+  </div>
+
+  <!-- Body -->
+  <div class="admin-body">
+
+    <!-- SIDEBAR -->
+    <div class="admin-sidebar">
+      <div class="section-title">📚 Bibliothèque de lieux</div>
+      <div class="diff-filter">
+        <span class="tag tag-easy" onclick="filterPresets('easy')">Facile</span>
+        <span class="tag tag-medium" onclick="filterPresets('medium')">Moyen</span>
+        <span class="tag tag-hard" onclick="filterPresets('hard')">Difficile</span>
+        <span class="tag tag-expert" onclick="filterPresets('expert')">Expert</span>
+        <span class="tag tag-all" onclick="filterPresets('all')">Tous</span>
+      </div>
+      <div id="preset-list"></div>
     </div>
 
-    <div style="display:grid;grid-template-columns:1fr 1fr;gap:20px;">
-      
-      <!-- Left column -->
-      <div>
-        <!-- Broadcast form -->
-        <div class="admin-card">
-          <div class="admin-title">🚀 Nouveau Round</div>
-          
-          <div style="margin-bottom:14px;">
-            <div class="label">URL de l'image 360°</div>
-            <input id="admin-image-url" class="input-field" type="url" 
-              placeholder="https://example.com/panorama.jpg"
-              value="https://upload.wikimedia.org/wikipedia/commons/thumb/a/af/All_Gizah_Pyramids.jpg/2560px-All_Gizah_Pyramids.jpg"/>
+    <!-- MAIN -->
+    <div class="admin-main">
+      <div class="stat-grid">
+        <div class="stat-card"><div class="stat-num" id="stat-players" style="color:var(--blue);">0</div><div class="stat-lbl">Joueurs</div></div>
+        <div class="stat-card"><div class="stat-num" id="stat-rounds" style="color:var(--emerald);">0</div><div class="stat-lbl">Rounds</div></div>
+        <div class="stat-card"><div class="stat-num" id="stat-avg" style="color:var(--amber);">—</div><div class="stat-lbl">Moy. score</div></div>
+      </div>
+
+      <div class="tab-bar">
+        <button class="tab active" onclick="switchTab('round')">🚀 Round</button>
+        <button class="tab" onclick="switchTab('leaderboard')">🏆 Classement</button>
+        <button class="tab" onclick="switchTab('custom')">✏️ Perso</button>
+      </div>
+
+      <!-- ROUND TAB -->
+      <div id="tab-round" class="tab-pane active">
+        <div class="card">
+          <div class="section-title">Lieu sélectionné</div>
+          <div id="selected-preview" style="background:var(--surface2);border:1px dashed var(--border2);border-radius:10px;padding:20px;text-align:center;color:var(--muted);font-size:13px;margin-bottom:14px;">
+            ← Sélectionnez un lieu dans la bibliothèque à gauche
           </div>
-          
-          <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:20px;">
-            <div>
-              <div class="label">Latitude cible</div>
-              <input id="admin-lat" class="input-field" type="number" step="0.0001" placeholder="29.9792" value="29.9792"/>
-            </div>
-            <div>
-              <div class="label">Longitude cible</div>
-              <input id="admin-lng" class="input-field" type="number" step="0.0001" placeholder="31.1342" value="31.1342"/>
-            </div>
-          </div>
-          
           <div style="display:flex;gap:10px;">
-            <button id="admin-broadcast-btn" class="btn-admin" style="flex:1;">📡 Diffuser le Round</button>
-            <button id="admin-stop-btn" class="btn-danger">⏹</button>
+            <button id="admin-broadcast-btn" class="btn btn-green" style="flex:1;">📡 Diffuser ce Round</button>
+            <button id="admin-stop-btn" class="btn btn-red" style="padding:11px 16px;" title="Arrêter le round">⏹</button>
           </div>
-        </div>
-
-        <!-- Sample locations -->
-        <div class="admin-card">
-          <div class="admin-title">📚 Exemples de Lieux</div>
-          <div style="display:flex;flex-direction:column;gap:8px;">
-            <button class="btn-secondary" style="text-align:left;font-size:12px;" onclick="
-              document.getElementById('admin-image-url').value='https://upload.wikimedia.org/wikipedia/commons/thumb/a/af/All_Gizah_Pyramids.jpg/2560px-All_Gizah_Pyramids.jpg';
-              document.getElementById('admin-lat').value=29.9792;
-              document.getElementById('admin-lng').value=31.1342;">
-              🏛️ Pyramides de Gizeh (Égypte)
-            </button>
-            <button class="btn-secondary" style="text-align:left;font-size:12px;" onclick="
-              document.getElementById('admin-image-url').value='https://upload.wikimedia.org/wikipedia/commons/thumb/1/10/Empire_State_Building_%28aerial_view%29.jpg/1280px-Empire_State_Building_%28aerial_view%29.jpg';
-              document.getElementById('admin-lat').value=40.7484;
-              document.getElementById('admin-lng').value=-73.9967;">
-              🗽 New York, USA
-            </button>
-            <button class="btn-secondary" style="text-align:left;font-size:12px;" onclick="
-              document.getElementById('admin-image-url').value='https://upload.wikimedia.org/wikipedia/commons/thumb/6/6e/Eiffelturm_Paris.jpg/800px-Eiffelturm_Paris.jpg';
-              document.getElementById('admin-lat').value=48.8584;
-              document.getElementById('admin-lng').value=2.2945;">
-              🗼 Tour Eiffel, Paris
-            </button>
-          </div>
+          <div id="round-status" style="margin-top:10px;font-size:12px;text-align:center;min-height:18px;"></div>
         </div>
       </div>
 
-      <!-- Right column: Leaderboard -->
-      <div>
-        <div class="admin-card" style="height:calc(100% - 0px);">
-          <div class="admin-title" style="display:flex;align-items:center;justify-content:space-between;">
-            <span>🏆 Classement Temps Réel</span>
-            <span id="player-count" style="font-size:11px;color:var(--muted);letter-spacing:0;text-transform:none;font-weight:400;"></span>
+      <!-- LEADERBOARD TAB -->
+      <div id="tab-leaderboard" class="tab-pane">
+        <div class="card">
+          <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px;">
+            <div class="section-title" style="margin:0;border:none;padding:0;">Classement temps réel</div>
+            <span id="lb-count" style="font-size:11px;color:var(--muted);"></span>
           </div>
-          <div id="admin-leaderboard">
-            <p style="color:var(--muted);font-size:13px;text-align:center;padding:32px 0;">
-              En attente des joueurs…
-            </p>
-          </div>
+          <div id="admin-leaderboard"><p style="color:var(--muted);font-size:13px;text-align:center;padding:24px 0;">En attente des joueurs…</p></div>
         </div>
       </div>
-    </div>
-    
-    <!-- Status banner -->
-    <div style="margin-top:16px;padding:16px;background:rgba(16,185,129,0.08);border:1px solid var(--emerald-dim);border-radius:12px;">
-      <p style="margin:0;font-size:12px;color:var(--emerald);line-height:1.6;">
-        <strong>✅ Firebase connecté :</strong> Projet <code style="background:rgba(255,255,255,0.1);padding:1px 6px;border-radius:4px;">geoguessrclasse</code> — Les données sont synchronisées en temps réel.
-      </p>
+
+      <!-- CUSTOM TAB -->
+      <div id="tab-custom" class="tab-pane">
+        <div class="card">
+          <div class="section-title">Lieu personnalisé</div>
+          <div style="margin-bottom:12px;">
+            <label class="label">URL de l'image 360°</label>
+            <input id="admin-image-url" class="input" type="url" placeholder="https://…/panorama.jpg"/>
+          </div>
+          <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:12px;">
+            <div><label class="label">Latitude</label><input id="admin-lat" class="input" type="number" step="0.0001" placeholder="48.8584"/></div>
+            <div><label class="label">Longitude</label><input id="admin-lng" class="input" type="number" step="0.0001" placeholder="2.2945"/></div>
+          </div>
+          <div style="margin-bottom:14px;">
+            <label class="label">Nom du lieu (optionnel)</label>
+            <input id="admin-custom-name" class="input" type="text" placeholder="Ex: Mon lieu mystère"/>
+          </div>
+          <button id="btn-custom-broadcast" class="btn btn-blue" style="width:100%;">📡 Diffuser ce lieu personnalisé</button>
+        </div>
+      </div>
+
     </div>
   </div>
 </div>
 
+
+<!-- ═══════════════════ SCRIPT ═══════════════════ -->
+<script type="module">
+import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-app.js";
+import { getFirestore, doc, setDoc, collection, onSnapshot, getDocs, writeBatch } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore.js";
+import { getAuth, signInAnonymously } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-auth.js";
+
+const firebaseConfig = {
+  apiKey: "AIzaSyBols3D4_fpOMAtbBgOcoAYy9ejpvCJr70",
+  authDomain: "geoguessrclasse.firebaseapp.com",
+  projectId: "geoguessrclasse",
+  storageBucket: "geoguessrclasse.firebasestorage.app",
+  messagingSenderId: "157640260530",
+  appId: "1:157640260530:web:454fbf0c10fd001cc682ab"
+};
+
+const COL = `artifacts/${firebaseConfig.projectId}/public`;
+const ADMIN_CODE = "PROF2024";
+
+let db, auth, uid;
+let map = null, viewer = null;
+let currentRound = null, guessLatLng = null, userMarker = null;
+let totalScore = 0, roundsPlayed = 0;
+let pseudo = "";
+let roundUnsub = null, lbUnsub = null;
+let selectedPreset = null;
+let resultTimer = null;
+let currentFilter = 'all';
+
+// ── PRESETS ──────────────────────────────────────────────────────────────────
+const PRESETS = [
+  // ── FACILE ──
+  {id:'f1',name:'Tour Eiffel',region:'Paris, France',flag:'🗼',diff:'easy',
+   url:'https://upload.wikimedia.org/wikipedia/commons/thumb/6/6e/Eiffelturm_Paris.jpg/1280px-Eiffelturm_Paris.jpg',lat:48.8584,lng:2.2945},
+  {id:'f2',name:'Pyramides de Gizeh',region:'Égypte',flag:'🏛️',diff:'easy',
+   url:'https://upload.wikimedia.org/wikipedia/commons/thumb/a/af/All_Gizah_Pyramids.jpg/2560px-All_Gizah_Pyramids.jpg',lat:29.9792,lng:31.1342},
+  {id:'f3',name:'Colisée',region:'Rome, Italie',flag:'🏟️',diff:'easy',
+   url:'https://upload.wikimedia.org/wikipedia/commons/thumb/d/de/Colosseo_2020.jpg/1280px-Colosseo_2020.jpg',lat:41.8902,lng:12.4922},
+  {id:'f4',name:'Big Ben',region:'Londres, Royaume-Uni',flag:'🕰️',diff:'easy',
+   url:'https://upload.wikimedia.org/wikipedia/commons/thumb/9/93/Clock_Tower_-_Palace_of_Westminster%2C_London_-_May_2007_icon.png/800px-Clock_Tower_-_Palace_of_Westminster%2C_London_-_May_2007_icon.png',lat:51.5007,lng:-0.1246},
+  {id:'f5',name:'Taj Mahal',region:'Agra, Inde',flag:'🕌',diff:'easy',
+   url:'https://upload.wikimedia.org/wikipedia/commons/thumb/b/bd/Taj_Mahal%2C_Agra%2C_India_edit3.jpg/1280px-Taj_Mahal%2C_Agra%2C_India_edit3.jpg',lat:27.1751,lng:78.0421},
+  {id:'f6',name:'Mont Fuji',region:'Japon',flag:'🗻',diff:'easy',
+   url:'https://upload.wikimedia.org/wikipedia/commons/thumb/1/1b/2006_07_09_Fuji_from_Shinkansen.jpg/1280px-2006_07_09_Fuji_from_Shinkansen.jpg',lat:35.3606,lng:138.7274},
+  {id:'f7',name:'Machu Picchu',region:'Pérou',flag:'🏔️',diff:'easy',
+   url:'https://upload.wikimedia.org/wikipedia/commons/thumb/e/eb/Machu_Picchu%2C_Peru.jpg/1280px-Machu_Picchu%2C_Peru.jpg',lat:-13.1631,lng:-72.5450},
+  {id:'f8',name:'Statue de la Liberté',region:'New York, USA',flag:'🗽',diff:'easy',
+   url:'https://upload.wikimedia.org/wikipedia/commons/thumb/4/47/New_york_times_square-terabass.jpg/1280px-New_york_times_square-terabass.jpg',lat:40.6892,lng:-74.0445},
+  // ── MOYEN ──
+  {id:'m1',name:'Opéra de Sydney',region:'Australie',flag:'🎭',diff:'medium',
+   url:'https://upload.wikimedia.org/wikipedia/commons/thumb/a/a0/Sydney_NSW_2000%2C_Australia_-_panoramio%2815%29.jpg/1280px-Sydney_NSW_2000%2C_Australia_-_panoramio%2815%29.jpg',lat:-33.8568,lng:151.2153},
+  {id:'m2',name:'Chichen Itza',region:'Mexique',flag:'🏯',diff:'medium',
+   url:'https://upload.wikimedia.org/wikipedia/commons/thumb/5/51/Chichen_Itza_3.jpg/1280px-Chichen_Itza_3.jpg',lat:20.6843,lng:-88.5678},
+  {id:'m3',name:'Petra',region:'Jordanie',flag:'🪨',diff:'medium',
+   url:'https://upload.wikimedia.org/wikipedia/commons/thumb/1/10/Treasury_petra_crop.jpg/1280px-Treasury_petra_crop.jpg',lat:30.3285,lng:35.4444},
+  {id:'m4',name:'Angkor Vat',region:'Cambodge',flag:'🛕',diff:'medium',
+   url:'https://upload.wikimedia.org/wikipedia/commons/thumb/a/a6/AngkorWat_02.jpg/1280px-AngkorWat_02.jpg',lat:13.4125,lng:103.8667},
+  {id:'m5',name:'Uluru (Ayers Rock)',region:'Australie',flag:'🔴',diff:'medium',
+   url:'https://upload.wikimedia.org/wikipedia/commons/thumb/b/b0/Uluru%2C_helicopter_view.jpg/1280px-Uluru%2C_helicopter_view.jpg',lat:-25.3444,lng:131.0369},
+  {id:'m6',name:'Mont Saint-Michel',region:'Normandie, France',flag:'⛪',diff:'medium',
+   url:'https://upload.wikimedia.org/wikipedia/commons/thumb/8/84/Mont_Saint_Michel_at_dusk_2007.jpg/1280px-Mont_Saint_Michel_at_dusk_2007.jpg',lat:48.6360,lng:-1.5115},
+  {id:'m7',name:'Pamukkale',region:'Turquie',flag:'🤍',diff:'medium',
+   url:'https://upload.wikimedia.org/wikipedia/commons/thumb/6/68/Pamukkale_Hierapolis.jpg/1280px-Pamukkale_Hierapolis.jpg',lat:37.9137,lng:29.1188},
+  {id:'m8',name:'Cappadoce',region:'Turquie',flag:'🎈',diff:'medium',
+   url:'https://upload.wikimedia.org/wikipedia/commons/thumb/3/3d/Cappadocia_Goreme.jpg/1280px-Cappadocia_Goreme.jpg',lat:38.6431,lng:34.8289},
+  {id:'m9',name:'Patagonie Torres del Paine',region:'Chili',flag:'🏔️',diff:'medium',
+   url:'https://upload.wikimedia.org/wikipedia/commons/thumb/2/22/Ruta_de_los_Parques_de_la_Patagonia.jpg/1280px-Ruta_de_los_Parques_de_la_Patagonia.jpg',lat:-50.9423,lng:-73.4068},
+  {id:'m10',name:'Acropole d\'Athènes',region:'Grèce',flag:'🏛️',diff:'medium',
+   url:'https://upload.wikimedia.org/wikipedia/commons/thumb/d/da/The_Parthenon_in_Athens.jpg/1280px-The_Parthenon_in_Athens.jpg',lat:37.9715,lng:23.7267},
+  // ── DIFFICILE ──
+  {id:'h1',name:'Lac Baïkal',region:'Sibérie, Russie',flag:'🧊',diff:'hard',
+   url:'https://upload.wikimedia.org/wikipedia/commons/thumb/4/4b/Baikal_Listvianka_2.jpg/1280px-Baikal_Listvianka_2.jpg',lat:53.5587,lng:108.1650},
+  {id:'h2',name:'Îles Féroé',region:'Danemark',flag:'🌊',diff:'hard',
+   url:'https://upload.wikimedia.org/wikipedia/commons/thumb/a/ae/F%C3%A6r%C3%B8erne.jpg/1280px-F%C3%A6r%C3%B8erne.jpg',lat:61.8926,lng:-6.9118},
+  {id:'h3',name:'Socotra',region:'Yémen',flag:'🌵',diff:'hard',
+   url:'https://upload.wikimedia.org/wikipedia/commons/thumb/2/22/Socotra_dragon_tree.JPG/1280px-Socotra_dragon_tree.JPG',lat:12.4634,lng:53.8237},
+  {id:'h4',name:'Delta de l\'Okavango',region:'Botswana',flag:'🐘',diff:'hard',
+   url:'https://upload.wikimedia.org/wikipedia/commons/thumb/f/f7/Okavango_Delta%2C_Botswana_%285%29.jpg/1280px-Okavango_Delta%2C_Botswana_%285%29.jpg',lat:-19.3173,lng:22.8582},
+  {id:'h5',name:'Vallée de la Mort',region:'Californie, USA',flag:'🏜️',diff:'hard',
+   url:'https://upload.wikimedia.org/wikipedia/commons/thumb/e/ee/Death_Valley_National_Park%2C_Zabriskie_Point.jpg/1280px-Death_Valley_National_Park%2C_Zabriskie_Point.jpg',lat:36.5054,lng:-117.0794},
+  {id:'h6',name:'Halong Bay',region:'Vietnam',flag:'⛵',diff:'hard',
+   url:'https://upload.wikimedia.org/wikipedia/commons/thumb/0/0e/Ha_Long_Bay_View.jpg/1280px-Ha_Long_Bay_View.jpg',lat:20.9101,lng:107.1839},
+  {id:'h7',name:'Namib Desert',region:'Namibie',flag:'🏜️',diff:'hard',
+   url:'https://upload.wikimedia.org/wikipedia/commons/thumb/7/7a/Sossusvlei_suicide_dune.jpg/1280px-Sossusvlei_suicide_dune.jpg',lat:-24.7277,lng:15.2952},
+  {id:'h8',name:'Danakil Depression',region:'Éthiopie',flag:'🌋',diff:'hard',
+   url:'https://upload.wikimedia.org/wikipedia/commons/thumb/0/08/DalolEthiopia.jpg/1280px-DalolEthiopia.jpg',lat:14.2417,lng:40.3000},
+  // ── EXPERT ──
+  {id:'e1',name:'Île de Pâques',region:'Chili (Pacifique)',flag:'🗿',diff:'expert',
+   url:'https://upload.wikimedia.org/wikipedia/commons/thumb/a/a2/Moai_Rano_raraku.jpg/1280px-Moai_Rano_raraku.jpg',lat:-27.1127,lng:-109.3497},
+  {id:'e2',name:'Salar d\'Uyuni',region:'Bolivie',flag:'🪞',diff:'expert',
+   url:'https://upload.wikimedia.org/wikipedia/commons/thumb/b/b3/Salar_de_Uyuni_en_Bolivia.jpg/1280px-Salar_de_Uyuni_en_Bolivia.jpg',lat:-20.1338,lng:-67.4891},
+  {id:'e3',name:'Svalbard',region:'Norvège (Arctique)',flag:'🐻‍❄️',diff:'expert',
+   url:'https://upload.wikimedia.org/wikipedia/commons/thumb/b/b8/Pyramiden%2C_Svalbard.jpg/1280px-Pyramiden%2C_Svalbard.jpg',lat:78.2232,lng:15.6267},
+  {id:'e4',name:'Kamtchatka',region:'Russie extrême-orient',flag:'🌋',diff:'expert',
+   url:'https://upload.wikimedia.org/wikipedia/commons/thumb/c/c5/Kronotsky_Zapovednik_05.jpg/1280px-Kronotsky_Zapovednik_05.jpg',lat:54.7500,lng:161.5000},
+  {id:'e5',name:'Qobustan',region:'Azerbaïdjan',flag:'🪨',diff:'expert',
+   url:'https://upload.wikimedia.org/wikipedia/commons/thumb/5/52/Rock_art_in_Gobustan.jpg/1280px-Rock_art_in_Gobustan.jpg',lat:40.0675,lng:49.3748},
+  {id:'e6',name:'Jiuzhaigou',region:'Sichuan, Chine',flag:'🌈',diff:'expert',
+   url:'https://upload.wikimedia.org/wikipedia/commons/thumb/a/a7/Jiuzhaigou_Valley_%28UN-UNESCO_protected%29.jpg/1280px-Jiuzhaigou_Valley_%28UN-UNESCO_protected%29.jpg',lat:33.2600,lng:103.9200},
+  {id:'e7',name:'Atacama (Geysers)',region:'Chili',flag:'💨',diff:'expert',
+   url:'https://upload.wikimedia.org/wikipedia/commons/thumb/c/cc/Geiseres_del_Tatio.jpg/1280px-Geiseres_del_Tatio.jpg',lat:-22.3297,lng:-68.0103},
+];
+
+// ── FIREBASE ─────────────────────────────────────────────────────────────────
+const app = initializeApp(firebaseConfig);
+db = getFirestore(app);
+auth = getAuth(app);
+signInAnonymously(auth).then(c=>{uid=c.user.uid;console.log('Auth OK',uid);}).catch(console.error);
+
+// ── UTILS ─────────────────────────────────────────────────────────────────────
+function show(id){document.querySelectorAll('.screen').forEach(s=>s.classList.remove('active'));document.getElementById(id).classList.add('active');}
+function haversine(a,b,c,d){const R=6371000,r=x=>x*Math.PI/180,dlat=r(c-a),dlng=r(d-b);const e=Math.sin(dlat/2)**2+Math.cos(r(a))*Math.cos(r(c))*Math.sin(dlng/2)**2;return R*2*Math.atan2(Math.sqrt(e),Math.sqrt(1-e));}
+function calcScore(d){return Math.round(5000*Math.exp(-0.000002*d));}
+
+// ── MAP ───────────────────────────────────────────────────────────────────────
+function initMap(){
+  if(map){map.remove();map=null;}
+  map=L.map('game-map',{zoomControl:true,attributionControl:false});
+  L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png',{maxZoom:19}).addTo(map);
+  map.setView([20,0],2);
+  map.on('click',e=>{
+    guessLatLng=e.latlng;
+    if(userMarker)map.removeLayer(userMarker);
+    userMarker=L.marker(e.latlng,{icon:L.divIcon({className:'',html:'<div style="width:16px;height:16px;background:#10b981;border:3px solid #fff;border-radius:50%;box-shadow:0 0 10px #10b98188;"></div>',iconAnchor:[8,8]})}).addTo(map);
+    const b=document.getElementById('btn-validate');b.disabled=false;b.style.opacity='1';b.style.cursor='pointer';
+  });
+}
+
+// ── PANORAMA ──────────────────────────────────────────────────────────────────
+function loadPanorama(url){
+  if(viewer){try{viewer.destroy();}catch(e){}viewer=null;}
+  document.getElementById('panorama').innerHTML='';
+  // Small delay to ensure container is ready
+  requestAnimationFrame(()=>{
+    viewer=pannellum.viewer('panorama',{
+      type:'equirectangular',
+      panorama:url,
+      autoLoad:true,
+      showControls:false,
+      compass:false,
+      mouseZoom:true,
+      draggable:true,
+      pitch:0,
+      yaw:0,
+      hfov:110,
+      minHfov:50,
+      maxHfov:120,
+    });
+  });
+}
+
+// ── LISTEN ROUND ──────────────────────────────────────────────────────────────
+function listenRound(){
+  if(roundUnsub)roundUnsub();
+  const ref=doc(db,COL,'activeRound');
+  roundUnsub=onSnapshot(ref,snap=>{
+    if(!snap.exists()||!snap.data().active){show('s-waiting');return;}
+    const data=snap.data();
+    if(!currentRound||currentRound.id!==data.id){currentRound=data;startRound(data);}
+  });
+}
+
+function listenPlayers(){
+  onSnapshot(collection(db,COL),snap=>{
+    const names=[];let tot=0;
+    snap.forEach(d=>{if(d.id.startsWith('lb_')){names.push(d.data().pseudo);tot+=d.data().totalScore||0;}});
+    const el=document.getElementById('waiting-players');
+    if(el)el.innerHTML=names.map(n=>`<div class="player-chip">${n}</div>`).join('');
+    const sp=document.getElementById('stat-players');if(sp)sp.textContent=names.length;
+    const sa=document.getElementById('stat-avg');if(sa&&names.length)sa.textContent=Math.round(tot/names.length).toLocaleString();
+  });
+}
+
+function startRound(data){
+  show('s-game');
+  guessLatLng=null;
+  if(userMarker&&map){map.removeLayer(userMarker);userMarker=null;}
+  const b=document.getElementById('btn-validate');b.disabled=true;b.style.opacity='.45';b.style.cursor='not-allowed';
+  document.getElementById('hud-score').textContent=totalScore.toLocaleString();
+  setTimeout(()=>{initMap();loadPanorama(data.imageUrl);},150);
+}
+
+// ── VALIDATE ──────────────────────────────────────────────────────────────────
+async function validateGuess(){
+  if(!guessLatLng||!currentRound)return;
+  const dist=haversine(guessLatLng.lat,guessLatLng.lng,currentRound.targetLat,currentRound.targetLng);
+  const score=calcScore(dist);
+  totalScore+=score;roundsPlayed++;
+  const tgt=L.latLng(currentRound.targetLat,currentRound.targetLng);
+  L.polyline([guessLatLng,tgt],{color:'#3b82f6',weight:2,dashArray:'7 4',opacity:.9}).addTo(map);
+  L.marker(tgt,{icon:L.divIcon({className:'',html:'<div style="width:18px;height:18px;background:#ef4444;border:3px solid #fff;border-radius:50%;box-shadow:0 0 12px #ef444488;"></div>',iconAnchor:[9,9]})}).addTo(map);
+  map.fitBounds([guessLatLng,tgt],{padding:[50,50]});
+  try{await setDoc(doc(db,COL,`lb_${uid}`),{pseudo,totalScore,lastScore:score,rounds:roundsPlayed,ts:Date.now()});}catch(e){console.error(e);}
+  showResult(score,dist);
+}
+
+function showResult(score,dist){
+  const km=dist<1000?`${Math.round(dist)} m`:`${(dist/1000).toFixed(1)} km`;
+  document.getElementById('res-score').textContent=`+${score.toLocaleString()}`;
+  document.getElementById('res-dist').textContent=km;
+  document.getElementById('res-total').textContent=totalScore.toLocaleString();
+  document.getElementById('res-bar').style.width=`${Math.round((score/5000)*100)}%`;
+  document.getElementById('w-score').textContent=totalScore.toLocaleString();
+  const ov=document.getElementById('result-overlay');ov.classList.add('show');
+  let cd=5;document.getElementById('res-countdown').textContent=cd;
+  if(resultTimer)clearInterval(resultTimer);
+  resultTimer=setInterval(()=>{cd--;document.getElementById('res-countdown').textContent=cd;if(cd<=0){clearInterval(resultTimer);ov.classList.remove('show');currentRound=null;show('s-waiting');}},1000);
+}
+
+// ── ADMIN ──────────────────────────────────────────────────────────────────────
+async function broadcastPreset(p){
+  const id=`round_${Date.now()}`;
+  await setDoc(doc(db,COL,'activeRound'),{id,imageUrl:p.url,targetLat:p.lat,targetLng:p.lng,name:p.name,active:true,startedAt:Date.now()});
+  const sr=document.getElementById('round-status');if(sr)sr.innerHTML=`<span style="color:var(--emerald)">✓ En cours : ${p.name}</span>`;
+  const st=document.getElementById('stat-rounds');if(st)st.textContent=parseInt(st.textContent||0)+1;
+}
+
+async function stopRound(){
+  await setDoc(doc(db,COL,'activeRound'),{active:false});
+  const sr=document.getElementById('round-status');if(sr)sr.innerHTML=`<span style="color:var(--muted)">Round arrêté.</span>`;
+}
+
+async function resetScores(){
+  if(!confirm('Remettre TOUS les scores à zéro ? Irréversible.'))return;
+  const snap=await getDocs(collection(db,COL));
+  const batch=writeBatch(db);
+  snap.forEach(d=>{if(d.id.startsWith('lb_')||d.id.startsWith('score_'))batch.delete(d.ref);});
+  await batch.commit();
+  alert('Scores remis à zéro.');
+}
+
+function listenLeaderboard(){
+  if(lbUnsub)lbUnsub();
+  lbUnsub=onSnapshot(collection(db,COL),snap=>{
+    const players=[];let tot=0;
+    snap.forEach(d=>{if(d.id.startsWith('lb_')){const x=d.data();players.push(x);tot+=x.totalScore||0;}});
+    players.sort((a,b)=>b.totalScore-a.totalScore);
+    const el=document.getElementById('admin-leaderboard');
+    const lbc=document.getElementById('lb-count');if(lbc)lbc.textContent=players.length+' joueur'+(players.length>1?'s':'');
+    const sp=document.getElementById('stat-players');if(sp)sp.textContent=players.length;
+    const sa=document.getElementById('stat-avg');if(sa&&players.length)sa.textContent=Math.round(tot/players.length).toLocaleString();
+    if(!el)return;
+    if(!players.length){el.innerHTML='<p style="color:var(--muted);font-size:13px;text-align:center;padding:24px 0;">Aucun joueur…</p>';return;}
+    el.innerHTML=players.slice(0,30).map((p,i)=>{
+      const cls=i===0?'lb-gold':i===1?'lb-silver':i===2?'lb-bronze':'lb-normal';
+      const medal=i===0?'🥇':i===1?'🥈':i===2?'🥉':`<span style="color:var(--muted);font-size:12px;width:22px;text-align:center;display:inline-block;">${i+1}</span>`;
+      return `<div class="lb-row ${cls}"><div style="display:flex;align-items:center;gap:9px;">${medal}<span style="font-weight:700;">${p.pseudo}</span>${p.rounds?`<span style="font-size:10px;color:var(--muted);">${p.rounds}r</span>`:''}</div><div class="mono-score">${(p.totalScore||0).toLocaleString()}</div></div>`;
+    }).join('');
+  });
+}
+
+// ── PRESETS UI ────────────────────────────────────────────────────────────────
+window.filterPresets=function(diff){
+  currentFilter=diff;renderPresets();
+};
+window.selectPreset=function(id){
+  selectedPreset=PRESETS.find(p=>p.id===id);
+  renderPresets();
+  const diffLabel={easy:'Facile',medium:'Moyen',hard:'Difficile',expert:'Expert'};
+  const el=document.getElementById('selected-preview');
+  if(el)el.innerHTML=`<div style="display:flex;align-items:center;gap:14px;text-align:left;"><span style="font-size:36px;">${selectedPreset.flag}</span><div><div style="font-size:15px;font-weight:800;margin-bottom:3px;">${selectedPreset.name}</div><div style="color:var(--muted);font-size:12px;margin-bottom:6px;">${selectedPreset.region}</div><span class="tag tag-${selectedPreset.diff}">${diffLabel[selectedPreset.diff]}</span></div></div>`;
+  switchTab('round');
+};
+window.switchTab=function(name){
+  document.querySelectorAll('.tab').forEach((t,i)=>{t.classList.toggle('active',['round','leaderboard','custom'][i]===name);});
+  document.querySelectorAll('.tab-pane').forEach(c=>c.classList.remove('active'));
+  document.getElementById('tab-'+name).classList.add('active');
+};
+
+function renderPresets(){
+  const list=PRESETS.filter(p=>currentFilter==='all'||p.diff===currentFilter);
+  const el=document.getElementById('preset-list');
+  if(!el)return;
+  const diffLabel={easy:'Facile',medium:'Moyen',hard:'Difficile',expert:'Expert'};
+  el.innerHTML=list.map(p=>`
+    <button class="preset-btn${selectedPreset?.id===p.id?' selected':''}" onclick="selectPreset('${p.id}')">
+      <span style="font-size:18px;">${p.flag}</span>
+      <div class="preset-info">
+        <div class="preset-name">${p.name}</div>
+        <div class="preset-region">${p.region}</div>
+      </div>
+      <span class="tag tag-${p.diff}" style="flex-shrink:0;">${diffLabel[p.diff]}</span>
+    </button>`).join('');
+}
+
+// ── DOM READY ─────────────────────────────────────────────────────────────────
+document.addEventListener('DOMContentLoaded',()=>{
+  renderPresets();
+
+  document.getElementById('btn-join').addEventListener('click',()=>{
+    pseudo=document.getElementById('inp-pseudo').value.trim();
+    if(!pseudo){document.getElementById('inp-pseudo').style.borderColor='var(--red)';return;}
+    document.getElementById('w-pseudo').textContent=pseudo;
+    document.getElementById('w-score').textContent='0';
+    show('s-waiting');
+    listenRound();
+    listenPlayers();
+  });
+
+  document.getElementById('inp-pseudo').addEventListener('keydown',e=>{if(e.key==='Enter')document.getElementById('btn-join').click();});
+
+  document.getElementById('btn-toggle-admin').addEventListener('click',()=>{
+    const p=document.getElementById('admin-login-panel');
+    p.style.display=p.style.display==='none'?'block':'none';
+  });
+
+  document.getElementById('btn-admin-login').addEventListener('click',()=>{
+    if(document.getElementById('inp-admin-code').value===ADMIN_CODE){
+      show('s-admin');renderPresets();listenLeaderboard();listenPlayers();
+    } else {
+      document.getElementById('admin-err').style.display='block';
+    }
+  });
+
+  document.getElementById('inp-admin-code').addEventListener('keydown',e=>{if(e.key==='Enter')document.getElementById('btn-admin-login').click();});
+
+  document.getElementById('admin-back-btn').addEventListener('click',()=>{
+    if(lbUnsub){lbUnsub();lbUnsub=null;}
+    show('s-welcome');
+  });
+
+  document.getElementById('btn-validate').addEventListener('click',validateGuess);
+
+  document.getElementById('admin-broadcast-btn').addEventListener('click',()=>{
+    if(!selectedPreset){alert('Sélectionnez d\'abord un lieu dans la bibliothèque.');return;}
+    broadcastPreset(selectedPreset);
+  });
+
+  document.getElementById('admin-stop-btn').addEventListener('click',stopRound);
+
+  document.getElementById('btn-custom-broadcast').addEventListener('click',()=>{
+    const url=document.getElementById('admin-image-url').value.trim();
+    const lat=parseFloat(document.getElementById('admin-lat').value);
+    const lng=parseFloat(document.getElementById('admin-lng').value);
+    const name=document.getElementById('admin-custom-name').value.trim()||'Lieu mystère';
+    if(!url||isNaN(lat)||isNaN(lng)){alert('Remplissez l\'URL et les coordonnées.');return;}
+    broadcastPreset({url,lat,lng,name,flag:'📍',diff:'medium'});
+  });
+
+  document.getElementById('btn-reset-scores').addEventListener('click',resetScores);
+});
+</script>
 </body>
 </html>
